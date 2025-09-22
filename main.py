@@ -1,22 +1,35 @@
 import asyncio
-import os
 import json
-from typing import Any, List, Optional, Dict
 from pathlib import Path
-from pydantic import BaseModel, Field
+from typing import Any, List, Optional
 
 from beeai_framework.context import RunContext
 from beeai_framework.emitter import Emitter
-from beeai_framework.tools import JSONToolOutput, Tool, ToolRunOptions
+from beeai_framework.tools import Tool, ToolRunOptions, JSONToolOutput
+from beeai_framework.tools.mcp import MCPTool
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.types import CallToolResult
-from beeai_framework.tools.mcp import MCPTool
+from pydantic import BaseModel, Field
+
+
+class CodeMatch(BaseModel):
+    """Represents a code match from ast-grep"""
+    file_path: str = Field(description="Path to the file containing the match")
+    byte_start: int = Field(description="Starting byte offset")
+    byte_end: int = Field(description="Ending byte offset")
+    code_snippet: str = Field(description="The matched code snippet")
+    pattern: str = Field(description="The pattern that matched")
+
+
+class AstGrepResults(BaseModel):
+    """Container for ast-grep results"""
+    matches: List[CodeMatch] = Field(description="List of code matches")
 
 
 class AstGrepMCPManager:
-    """Manages ast-grep MCP server connection and tools"""
-
+    """Manages ast-grep MCP server connection and tools
+        https://hub.docker.com/r/mcp/ast-grep
+    """
     def __init__(self, codebase_path: str):
         self.codebase_path = Path(codebase_path).resolve()
         self._session: Optional[ClientSession] = None
@@ -52,7 +65,7 @@ class AstGrepMCPManager:
         pattern: str,
         language: str = "python",
         files: Optional[List[str]] = None
-    ) -> None:
+    ) -> List[CodeMatch]:
         """Execute ast-grep pattern using the first available tool"""
 
         if not self._available_tools:
@@ -63,9 +76,9 @@ class AstGrepMCPManager:
         try:
             args = [
                 "run",  # ast-grep run command
-                "-l", language,  # language flag
+                "-l", language,
                 "--pattern", "$NAME = $VAL",  # pattern to search
-                "--json"  # output format
+                "--json"
             ]
             if files:
                 args.extend(files)
@@ -81,13 +94,28 @@ class AstGrepMCPManager:
                 context=None
             )
 
+            result = result.to_json_safe()[0]
+            result = json.loads(result.text)
 
-            exit(1)
+            matches = []
+            for res in result:
+                matches.append(CodeMatch(
+                    file_path=res["file"],
+                    byte_start=res["range"]["byteOffset"]["start"],
+                    byte_end=res["range"]["byteOffset"]["end"],
+                    code_snippet=res["text"],
+                    pattern=pattern,
+                ))
+            return matches
 
         except Exception as e:
             print(f"❌ Error executing pattern '{pattern}': {e}")
             print(f"🔍 Tool schema: {ast_grep_tool.input_schema}")
+            # return await self._fallback_execution(pattern, language, files)
             return []
+
+    def _parse_result(self, result_data: Any, pattern: str) -> None:
+        pass
 
 
 class BaseSimplifiedMCPTool(Tool):
@@ -117,7 +145,7 @@ class BaseSimplifiedMCPTool(Tool):
         language: str,
         files: Optional[List[str]] = None,
         context: RunContext = None
-    ) -> None:
+    ) -> List[CodeMatch]:
         """Execute ast-grep template pattern"""
 
         emitter = self._create_emitter()
@@ -160,7 +188,7 @@ class SimplifiedFunctionDefinitionTool(BaseSimplifiedMCPTool):
         input: FunctionDefinitionInput,
         options: ToolRunOptions | None,
         context: RunContext
-    ) -> None:
+    ) -> JSONToolOutput:
         # Template: function-definition pattern
         pattern = f"def {input.function_name}(...): ..."
 
@@ -170,8 +198,9 @@ class SimplifiedFunctionDefinitionTool(BaseSimplifiedMCPTool):
             files=input.target_files,
             context=context
         )
+        result = AstGrepResults(matches=matches)
 
-        return None
+        return JSONToolOutput(result=result.model_dump())
 
     def _create_emitter(self) -> Emitter:
         return Emitter.root().child(
@@ -193,7 +222,6 @@ async def main() -> None:
         result = await tool._run(test_input, None, None)
         print(f"✅ Tool executed successfully")
         print(result)
-        print(f"📋 Result: {result.result}")
     except Exception as e:
         print(f"❌ Tool execution failed: {e}")
         import traceback
